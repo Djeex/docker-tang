@@ -160,6 +160,7 @@ Rollback: put the `padhihomelab/tang` line back. Both images use the same key di
 - **Why tang is built from source**: Alpine has no `tang` package (only `jose` 14, older than the one `padhihomelab/tang` uses). tang and jose are built from their upstream release tags (`latchset/tang` v16, `latchset/jose` v15), the same code as `padhihomelab/tang`, in a separate build stage. Only the binaries reach the final image.
 - **Base image**: `alpine` pinned by digest; Renovate proposes base digest and tang/jose tag updates as PRs.
 - **Weekly rebuild**: every Monday the CI rebuilds without cache, so `apk upgrade` pulls the latest Alpine fixes, runs all tests and the scan, then republishes `latest`, `tangNN` and `tangNN-YYYYMMDD`.
+- **Manual publish**: running the workflow by hand (Actions → CI → Run workflow) publishes the current `VERSION` with all its tags, without bump.
 - **Trivy**: the build fails on any fixable HIGH or CRITICAL vulnerability.
 - **Minimal image**: tang, jose, socat, tini and su-exec only; busybox `wget` serves the healthcheck. No secret in the image.
 

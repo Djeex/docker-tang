@@ -7,6 +7,7 @@ on:
     branches: [main]
   schedule:
     - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   build-and-scan:
@@ -77,7 +78,7 @@ jobs:
 
       # Secrets are only used below, on main, never on pull requests (forks).
       - name: Publish tagged image
-        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         run: |
           IMAGE=git.djeex.fr/djeex/docker-tang
           GHCR_IMAGE=ghcr.io/djeex/docker-tang
@@ -105,13 +106,25 @@ jobs:
             exit 0
           fi
 
+          # BASE_REF empty = no previous state to diff against: every tracked file
+          # counts as changed (VERSION included, so it is published as-is).
           BEFORE="${{ github.event.before }}"
-          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
-            BASE_REF="$BEFORE"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run: publishing the current VERSION without bump."
+            BASE_REF=$(git describe --tags --abbrev=0 2>/dev/null || true)
+            CHANGED=$(git ls-files)
+          elif [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "First push of the branch: treating every file as changed."
+            BASE_REF=""
+            CHANGED=$(git ls-files)
           else
-            BASE_REF="HEAD~1"
+            if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+              BASE_REF="$BEFORE"
+            else
+              BASE_REF="HEAD~1"
+            fi
+            CHANGED=$(git diff --name-only "$BASE_REF" "${{ github.sha }}")
           fi
-          CHANGED=$(git diff --name-only "$BASE_REF" "${{ github.sha }}")
           echo "Changed files:"
           echo "$CHANGED"
 
@@ -179,7 +192,11 @@ jobs:
           fi
 
           REPO_URL="https://git.djeex.fr/Djeex/docker-tang"
-          COMMIT_LIST=$(git log --no-merges --format="- %s ([%h](${REPO_URL}/commit/%H))" "$BASE_REF".."${{ github.sha }}")
+          COMMIT_RANGE="${{ github.sha }}"
+          if [ -n "$BASE_REF" ]; then
+            COMMIT_RANGE="$BASE_REF..${{ github.sha }}"
+          fi
+          COMMIT_LIST=$(git log --no-merges --format="- %s ([%h](${REPO_URL}/commit/%H))" "$COMMIT_RANGE")
 
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           SOURCE_LINE="[${SHORT_SHA}](${REPO_URL}/commit/${{ github.sha }})"
