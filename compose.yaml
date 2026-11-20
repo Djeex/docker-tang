@@ -1,0 +1,11 @@
+services:
+  tang:
+    restart: unless-stopped
+    container_name: tang
+    volumes:
+      - /docker/tang/db:/db
+    ports:
+      - 1234:8080
+    stdin_open: true
+    tty: true
+    image: git.djeex.fr/djeex/docker-tang
