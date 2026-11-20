@@ -1,0 +1,243 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan for secrets
+        run: |
+          # docker cp, not a build COPY: a repo's own .dockerignore (e.g. one that
+          # excludes .git for prod builds) would otherwise silently give an empty,
+          # falsely-clean scan.
+          CID=$(docker create zricethezav/gitleaks:v8.30.1 detect --source=/repo --no-banner -v)
+          docker cp . "$CID:/repo"
+          docker start -a "$CID"
+          STATUS=$?
+          docker rm "$CID" > /dev/null
+          exit $STATUS
+
+      - name: Lint Dockerfile with hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.15.1-alpine hadolint --failure-threshold error - < Dockerfile
+
+      - name: Build Docker image
+        # --no-cache so `apk upgrade` really fetches the latest Alpine fixes:
+        # the base is pinned by digest, a cached layer would never change.
+        run: docker build --no-cache -t tang:ci .
+
+      - name: Smoke test (syntax check)
+        run: |
+          docker run --rm --entrypoint sh tang:ci -c '
+            for f in /usr/local/bin/docker-entrypoint /usr/local/bin/start-servers \
+                     /usr/local/bin/check-servers /etc/docker-entrypoint.d/99-extra-scripts/*.sh; do
+              sh -n "$f" || exit 1
+            done
+            tangd -v'
+
+      - name: Run unit tests
+        run: |
+          docker build --target test -t tang:test .
+          docker run --rm tang:test bats /app/tests
+
+      - name: Lint shell scripts with shellcheck
+        run: docker build --target lint -t tang:lint .
+
+      - name: Compatibility test against padhihomelab/tang
+        run: |
+          docker build --target padhi-reference -t tang:padhi-reference .
+          docker build --target clevis -t tang:clevis .
+          bash tests/compat.sh tang:ci tang:padhi-reference tang:test tang:clevis
+
+      - name: Scan with Trivy (fixable high/critical - blocking)
+        run: |
+          docker run --rm \
+            -e DOCKER_HOST=tcp://dockerhost:2375 \
+            --add-host=dockerhost:host-gateway \
+            aquasec/trivy:0.74.0 image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL tang:ci
+
+      - name: Scan with Trivy (all high/critical - informative)
+        run: |
+          docker run --rm \
+            -e DOCKER_HOST=tcp://dockerhost:2375 \
+            --add-host=dockerhost:host-gateway \
+            aquasec/trivy:0.74.0 image --exit-code 0 --severity HIGH,CRITICAL tang:ci
+
+      # Secrets are only used below, on main, never on pull requests (forks).
+      - name: Publish tagged image
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
+        run: |
+          IMAGE=git.djeex.fr/djeex/docker-tang
+          GHCR_IMAGE=ghcr.io/djeex/docker-tang
+
+          TANG_MAJOR=$(sed -n 's/^ARG TANG_VERSION=v\{0,1\}\([0-9]*\).*/\1/p' Dockerfile)
+          TANG_TAG="tang${TANG_MAJOR}"
+          TANG_DATED_TAG="${TANG_TAG}-$(date -u +%Y%m%d)"
+
+          # Retag the already-built, already-tested, already-scanned image — never
+          # rebuild for publish, so what ships is byte-for-byte what was checked.
+          push_tags() {
+            echo "${{ secrets.REGISTRY_TOKEN }}" | docker login git.djeex.fr -u Djeex --password-stdin
+            echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u Djeex --password-stdin
+            for REPO in "$IMAGE" "$GHCR_IMAGE"; do
+              for TAG in "$@"; do
+                docker tag tang:ci "$REPO:$TAG"
+                docker push "$REPO:$TAG"
+              done
+            done
+          }
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Weekly rebuild: refreshing latest, $TANG_TAG and $TANG_DATED_TAG with the latest Alpine fixes."
+            push_tags latest "$TANG_TAG" "$TANG_DATED_TAG"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            BASE_REF="$BEFORE"
+          else
+            BASE_REF="HEAD~1"
+          fi
+          CHANGED=$(git diff --name-only "$BASE_REF" "${{ github.sha }}")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if ! echo "$CHANGED" | grep -qE '^(Dockerfile|VERSION|[a-z-]+\.sh|entrypoint-scripts/.+)$'; then
+            echo "No container-relevant file changed, skipping publish."
+            exit 0
+          fi
+
+          if echo "$CHANGED" | grep -qE '^VERSION$'; then
+            echo "VERSION was manually edited in this push, using it as-is."
+          else
+            echo "VERSION untouched but container files changed, auto-bumping the build number (Z)."
+            OLD_VERSION=$(tr -d '[:space:]' < VERSION)
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_VERSION"
+            NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "$NEW_VERSION" > VERSION
+
+            git config user.name "docker-tang-ci"
+            git config user.email "ci@git.djeex.fr"
+            git add VERSION
+            git commit -m "Bump build version to $NEW_VERSION [skip ci]"
+
+            # Belt and suspenders: actions/checkout can leave its own ephemeral
+            # credential injected as an extraheader, which would silently override
+            # the URL-embedded token below. persist-credentials:false on checkout
+            # should already prevent this, but strip it here too just in case.
+            git config --unset-all http.https://git.djeex.fr/.extraheader || true
+
+            git push "https://Djeex:${{ secrets.CI_PUSH_TOKEN }}@git.djeex.fr/Djeex/docker-tang.git" HEAD:main
+
+            # The image was built before the bump: rebuild from cache so the
+            # banner shows the published version (only the VERSION layer changes).
+            docker build -t tang:ci .
+          fi
+
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          MINOR_TAG="${MAJOR}.${MINOR}"
+
+          push_tags latest "$MINOR_TAG" "$VERSION" "$TANG_TAG" "$TANG_DATED_TAG"
+
+          TRIGGER_MSG=$(git log -1 --format=%s "${{ github.sha }}")
+          PR_NUM=$(echo "$TRIGGER_MSG" | grep -oE '#[0-9]+' | head -1 | tr -d '#' || true)
+
+          CATEGORY="🔧 Maintenance"
+          CHANGE_TITLE="$TRIGGER_MSG"
+
+          if [ -n "$PR_NUM" ]; then
+            PR_JSON=$(curl -s -H "Authorization: token ${{ secrets.CI_PUSH_TOKEN }}" \
+              "https://git.djeex.fr/api/v1/repos/Djeex/docker-tang/pulls/$PR_NUM")
+            PR_TITLE=$(echo "$PR_JSON" | jq -r '.title // empty' 2>/dev/null || true)
+            LABELS=$(echo "$PR_JSON" | jq -r '.labels[]?.name' 2>/dev/null || true)
+
+            if [ -n "$PR_TITLE" ]; then
+              CHANGE_TITLE="$PR_TITLE"
+            fi
+
+            if echo "$LABELS" | grep -qx 'bug'; then
+              CATEGORY="⚠️ Hotfix"
+            elif echo "$LABELS" | grep -qx 'major'; then
+              CATEGORY="💥 Breaking change"
+            elif echo "$LABELS" | grep -qx 'minor'; then
+              CATEGORY="✨ Update"
+            fi
+          fi
+
+          REPO_URL="https://git.djeex.fr/Djeex/docker-tang"
+          COMMIT_LIST=$(git log --no-merges --format="- %s ([%h](${REPO_URL}/commit/%H))" "$BASE_REF".."${{ github.sha }}")
+
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          SOURCE_LINE="[${SHORT_SHA}](${REPO_URL}/commit/${{ github.sha }})"
+          if [ -n "$PR_NUM" ]; then
+            SOURCE_LINE="[#${PR_NUM}](${REPO_URL}/pulls/${PR_NUM}) · ${SOURCE_LINE}"
+          fi
+
+          BODY=$(cat <<EOF
+          ## Changelog
+
+          ### ${CATEGORY}
+          ${CHANGE_TITLE}
+
+          **Source:** ${SOURCE_LINE}
+          **Image:** \`${IMAGE}:${VERSION}\` (also \`${TANG_TAG}\`, \`${TANG_DATED_TAG}\`)
+
+          **Commits:**
+          ${COMMIT_LIST}
+          EOF
+          )
+
+          JSON_PAYLOAD=$(jq -n \
+            --arg tag "$VERSION" \
+            --arg name "$VERSION" \
+            --arg body "$BODY" \
+            '{tag_name: $tag, name: $name, target_commitish: "main", body: $body}')
+
+          curl -s -o /dev/null -w "Release API response: %{http_code}\n" -X POST \
+            -H "Authorization: token ${{ secrets.CI_PUSH_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD" \
+            "https://git.djeex.fr/api/v1/repos/Djeex/docker-tang/releases"
+
+          MIRROR_NOTICE="_This github repo is a mirror of https://git.djeex.fr/Djeex/docker-tang. You'll find full package, PR, history and release note there._"
+          GH_BODY=$(printf '%s\n\n%s' "$MIRROR_NOTICE" "$BODY")
+
+          GH_JSON_PAYLOAD=$(jq -n \
+            --arg tag "$VERSION" \
+            --arg name "$VERSION" \
+            --arg body "$GH_BODY" \
+            --arg sha "${{ github.sha }}" \
+            '{tag_name: $tag, name: $name, target_commitish: $sha, body: $body}')
+
+          GH_STATUS=0
+          for i in 1 2 3 4 5; do
+            GH_STATUS=$(curl -s -o /tmp/gh_release.json -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$GH_JSON_PAYLOAD" \
+              "https://api.github.com/repos/Djeex/docker-tang/releases")
+            if [ "$GH_STATUS" = "201" ]; then
+              break
+            fi
+            echo "GitHub Release attempt $i failed (HTTP $GH_STATUS) — mirror may not have synced this commit yet, retrying in 15s..."
+            sleep 15
+          done
+          echo "GitHub Release API response: $GH_STATUS"
+          if [ "$GH_STATUS" != "201" ]; then
+            cat /tmp/gh_release.json 2>/dev/null || true
+          fi
