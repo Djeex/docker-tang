@@ -4,7 +4,7 @@
     {
       "customType": "regex",
       "description": "tang and jose release tags built from source in the Dockerfile",
-      "fileMatch": ["(^|/)Dockerfile$"],
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+ARG \\S+=(?<currentValue>\\S+)"
       ]
@@ -12,7 +12,7 @@
     {
       "customType": "regex",
       "description": "CI tool images started with docker run/create in the workflow",
-      "fileMatch": ["(^|/)\\.gitea/workflows/[^/]+\\.ya?ml$"],
+      "managerFilePatterns": ["/(^|/)\\.gitea/workflows/[^/]+\\.ya?ml$/"],
       "matchStrings": [
         "(?<depName>aquasec/trivy|zricethezav/gitleaks|hadolint/hadolint):(?<currentValue>[\\w.-]+)"
       ],
