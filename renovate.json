@@ -1,9 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", "docker:pinDigests"],
-  "timezone": "Europe/Paris",
-  "minimumReleaseAge": "3 days",
-  "labels": ["bot"],
+  "extends": ["local>labeex/renovateex"],
   "customManagers": [
     {
       "customType": "regex",
@@ -12,43 +9,6 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+ARG \\S+=(?<currentValue>\\S+)"
       ]
-    },
-    {
-      "customType": "regex",
-      "description": "CI tool images started with docker run/create in the workflow",
-      "managerFilePatterns": ["/(^|/)\\.gitea/workflows/[^/]+\\.ya?ml$/"],
-      "matchStrings": [
-        "(?<depName>aquasec/trivy|zricethezav/gitleaks|hadolint/hadolint):(?<currentValue>[\\w.-]+)"
-      ],
-      "datasourceTemplate": "docker"
     }
-  ],
-  "packageRules": [
-    {
-      "matchManagers": ["custom.regex"],
-      "pinDigests": false
-    },
-    {
-      "matchManagers": ["dockerfile"],
-      "matchUpdateTypes": ["patch"],
-      "automerge": true
-    },
-    {
-      "matchManagers": ["dockerfile"],
-      "matchUpdateTypes": ["pin", "digest"],
-      "automerge": true
-    },
-    {
-      "matchUpdateTypes": ["major"],
-      "addLabels": ["major"]
-    },
-    {
-      "matchUpdateTypes": ["minor"],
-      "addLabels": ["minor"]
-    }
-  ],
-  "vulnerabilityAlerts": {
-    "enabled": true,
-    "addLabels": ["bug"]
-  }
+  ]
 }
