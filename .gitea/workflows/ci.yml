@@ -78,7 +78,22 @@ jobs:
       # Secrets are only used below, on main, never on pull requests (forks).
       - name: Publish tagged image
         if: (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        # Every value reaches the script through env: no secret is written into
+        # the script, and no token goes on a command line or in a URL.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          CI_PUSH_TOKEN: ${{ secrets.CI_PUSH_TOKEN }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          # Registry logins go to a temporary docker config, deleted at the end.
+          # Only the logins and pushes use it: the rebuild keeps the default
+          # config (and its CLI plugins).
+          LOGIN_CONFIG=$(mktemp -d)
+          trap 'rm -rf "$LOGIN_CONFIG"' EXIT
+
           IMAGE=git.djeex.fr/djeex/docker-tang
           GHCR_IMAGE=ghcr.io/djeex/docker-tang
 
@@ -89,8 +104,10 @@ jobs:
           # Retag the already-built, already-tested, already-scanned image — never
           # rebuild for publish, so what ships is byte-for-byte what was checked.
           push_tags() {
-            echo "${{ secrets.REGISTRY_TOKEN }}" | docker login git.djeex.fr -u Djeex --password-stdin
-            echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u Djeex --password-stdin
+            local DOCKER_CONFIG="$LOGIN_CONFIG"
+            export DOCKER_CONFIG
+            printf '%s\n' "$REGISTRY_TOKEN" | docker login git.djeex.fr -u Djeex --password-stdin
+            printf '%s\n' "$GH_TOKEN" | docker login ghcr.io -u Djeex --password-stdin
             for REPO in "$IMAGE" "$GHCR_IMAGE"; do
               for TAG in "$@"; do
                 docker tag tang:ci "$REPO:$TAG"
@@ -99,7 +116,7 @@ jobs:
             done
           }
 
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "$EVENT_NAME" = "schedule" ]; then
             echo "Weekly rebuild: refreshing latest, $TANG_TAG and $TANG_DATED_TAG with the latest Alpine fixes."
             push_tags latest "$TANG_TAG" "$TANG_DATED_TAG"
             exit 0
@@ -107,8 +124,7 @@ jobs:
 
           # BASE_REF empty = no previous state to diff against: every tracked file
           # counts as changed (VERSION included, so it is published as-is).
-          BEFORE="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "Manual run: publishing the current VERSION without bump."
             BASE_REF=$(git describe --tags --abbrev=0 2>/dev/null || true)
             CHANGED=$(git ls-files)
@@ -122,7 +138,7 @@ jobs:
             else
               BASE_REF="HEAD~1"
             fi
-            CHANGED=$(git diff --name-only "$BASE_REF" "${{ github.sha }}")
+            CHANGED=$(git diff --name-only "$BASE_REF" "$SHA")
           fi
           echo "Changed files:"
           echo "$CHANGED"
@@ -148,11 +164,16 @@ jobs:
 
             # Belt and suspenders: actions/checkout can leave its own ephemeral
             # credential injected as an extraheader, which would silently override
-            # the URL-embedded token below. persist-credentials:false on checkout
+            # the credential below. persist-credentials:false on checkout
             # should already prevent this, but strip it here too just in case.
             git config --unset-all http.https://git.djeex.fr/.extraheader || true
 
-            git push "https://Djeex:${{ secrets.CI_PUSH_TOKEN }}@git.djeex.fr/Djeex/docker-tang.git" HEAD:main
+            # One-shot credential helper: git reads the token from the
+            # environment when asked, nothing is stored.
+            # shellcheck disable=SC2016
+            GIT_TERMINAL_PROMPT=0 git -c credential.helper= \
+              -c 'credential.helper=!f() { test "$1" = get || exit 0; echo username=Djeex; echo "password=${CI_PUSH_TOKEN}"; }; f' \
+              push https://git.djeex.fr/Djeex/docker-tang.git HEAD:main
 
             # The image was built before the bump: rebuild from cache so the
             # banner shows the published version (only the VERSION layer changes).
@@ -165,14 +186,14 @@ jobs:
 
           push_tags latest "$MINOR_TAG" "$VERSION" "$TANG_TAG" "$TANG_DATED_TAG"
 
-          TRIGGER_MSG=$(git log -1 --format=%s "${{ github.sha }}")
+          TRIGGER_MSG=$(git log -1 --format=%s "$SHA")
           PR_NUM=$(echo "$TRIGGER_MSG" | grep -oE '#[0-9]+' | head -1 | tr -d '#' || true)
 
           CATEGORY="🔧 Maintenance"
           CHANGE_TITLE="$TRIGGER_MSG"
 
           if [ -n "$PR_NUM" ]; then
-            PR_JSON=$(curl -s -H "Authorization: token ${{ secrets.CI_PUSH_TOKEN }}" \
+            PR_JSON=$(printf 'header = "Authorization: token %s"\n' "$CI_PUSH_TOKEN" | curl -s -K - \
               "https://git.djeex.fr/api/v1/repos/Djeex/docker-tang/pulls/$PR_NUM")
             PR_TITLE=$(echo "$PR_JSON" | jq -r '.title // empty' 2>/dev/null || true)
             LABELS=$(echo "$PR_JSON" | jq -r '.labels[]?.name' 2>/dev/null || true)
@@ -191,14 +212,14 @@ jobs:
           fi
 
           REPO_URL="https://git.djeex.fr/Djeex/docker-tang"
-          COMMIT_RANGE="${{ github.sha }}"
+          COMMIT_RANGE="$SHA"
           if [ -n "$BASE_REF" ]; then
-            COMMIT_RANGE="$BASE_REF..${{ github.sha }}"
+            COMMIT_RANGE="$BASE_REF..$SHA"
           fi
           COMMIT_LIST=$(git log --no-merges --format="- %s ([%h](${REPO_URL}/commit/%H))" "$COMMIT_RANGE")
 
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          SOURCE_LINE="[${SHORT_SHA}](${REPO_URL}/commit/${{ github.sha }})"
+          SHORT_SHA=$(echo "$SHA" | cut -c1-7)
+          SOURCE_LINE="[${SHORT_SHA}](${REPO_URL}/commit/${SHA})"
           if [ -n "$PR_NUM" ]; then
             SOURCE_LINE="[#${PR_NUM}](${REPO_URL}/pulls/${PR_NUM}) · ${SOURCE_LINE}"
           fi
@@ -223,8 +244,7 @@ jobs:
             --arg body "$BODY" \
             '{tag_name: $tag, name: $name, target_commitish: "main", body: $body}')
 
-          curl -s -o /dev/null -w "Release API response: %{http_code}\n" -X POST \
-            -H "Authorization: token ${{ secrets.CI_PUSH_TOKEN }}" \
+          printf 'header = "Authorization: token %s"\n' "$CI_PUSH_TOKEN" | curl -s -K - -o /dev/null -w "Release API response: %{http_code}\n" -X POST \
             -H "Content-Type: application/json" \
             -d "$JSON_PAYLOAD" \
             "https://git.djeex.fr/api/v1/repos/Djeex/docker-tang/releases"
@@ -236,13 +256,12 @@ jobs:
             --arg tag "$VERSION" \
             --arg name "$VERSION" \
             --arg body "$GH_BODY" \
-            --arg sha "${{ github.sha }}" \
+            --arg sha "$SHA" \
             '{tag_name: $tag, name: $name, target_commitish: $sha, body: $body}')
 
           GH_STATUS=0
           for i in 1 2 3 4 5; do
-            GH_STATUS=$(curl -s -o /tmp/gh_release.json -w "%{http_code}" -X POST \
-              -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            GH_STATUS=$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" | curl -s -K - -o /tmp/gh_release.json -w "%{http_code}" -X POST \
               -H "Accept: application/vnd.github+json" \
               -H "Content-Type: application/json" \
               -d "$GH_JSON_PAYLOAD" \
