@@ -24,7 +24,9 @@ REF=${2:-tang:padhi-reference}
 CLIENT=${3:-tang:test}
 CLEVIS=${4:-tang:clevis}
 
-ID="tang-compat-$$"
+# Unique per run: $$ alone repeats from one CI job container to the next, and
+# all jobs share the same Docker daemon, so a leftover volume could be reused.
+ID="tang-compat-$(date +%s)-$$-$RANDOM"
 NET="$ID-net"
 VOL="$ID-db"
 FRESH_VOL="$ID-fresh"
@@ -34,6 +36,14 @@ FAILED=0
 log()  { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 ok()   { log "[✓] $*"; }
 ko()   { log "[✗] $*"; FAILED=1; }
+
+# Never reuse (or later remove) volumes this run did not create.
+for v in "$VOL" "$FRESH_VOL"; do
+    if docker volume inspect "$v" >/dev/null 2>&1; then
+        log "[✗] volume $v already exists, refusing to reuse it"
+        exit 1
+    fi
+done
 
 cleanup() {
     docker rm -f "$ID-ref" "$ID-new" "$ID-fresh" >/dev/null 2>&1 || true
